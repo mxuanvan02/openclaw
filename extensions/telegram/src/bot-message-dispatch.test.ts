@@ -3816,6 +3816,196 @@ describe("dispatchTelegramMessage draft streaming", () => {
     expect(deliverReplies).not.toHaveBeenCalled();
   });
 
+  it("does not redeliver a materialized partial for the same assistant message", async () => {
+    const { answerDraftStream } = setupDraftStreams({ answerMessageId: 2001 });
+    const text = "I will fix the layout now.";
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
+      async ({ dispatcherOptions, replyOptions }) => {
+        await replyOptions?.onPartialReply?.({ text });
+        await dispatcherOptions.deliver(
+          setReplyPayloadMetadata({ text }, { assistantMessageIndex: 0 }),
+          { kind: "block", assistantMessageIndex: 0 },
+        );
+        await replyOptions?.onToolStart?.({ name: "exec", phase: "start" });
+        await dispatcherOptions.deliver(
+          setReplyPayloadMetadata({ text }, { assistantMessageIndex: 0 }),
+          { kind: "final", assistantMessageIndex: 0 },
+        );
+        return { queuedFinal: true };
+      },
+    );
+
+    await dispatchWithContext({
+      context: createContext(),
+      streamMode: "partial",
+      telegramCfg: { streaming: { mode: "partial" } },
+    });
+
+    expect(answerDraftStream.update.mock.calls).toEqual([[text]]);
+    expect(emitInternalMessageSentHook).toHaveBeenCalledTimes(1);
+    expect(deliverReplies).not.toHaveBeenCalled();
+  });
+
+  it("keeps media caption dedupe receipt when delivery skips before retry", async () => {
+    const { answerDraftStream } = setupDraftStreams({ answerMessageId: 2001 });
+    const text = "I will fix the layout now.";
+    const mediaUrl = "https://example.com/fixed-layout.png";
+    deliverReplies
+      .mockResolvedValueOnce({ delivered: false })
+      .mockResolvedValueOnce({ delivered: true });
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
+      async ({ dispatcherOptions, replyOptions }) => {
+        await replyOptions?.onPartialReply?.({ text });
+        await dispatcherOptions.deliver(
+          setReplyPayloadMetadata({ text }, { assistantMessageIndex: 0 }),
+          { kind: "block", assistantMessageIndex: 0 },
+        );
+        await replyOptions?.onToolStart?.({ name: "exec", phase: "start" });
+        const finalPayload = setReplyPayloadMetadata(
+          { text, mediaUrl },
+          { assistantMessageIndex: 0 },
+        );
+        await dispatcherOptions.deliver(finalPayload, {
+          kind: "final",
+          assistantMessageIndex: 0,
+        });
+        await dispatcherOptions.deliver(finalPayload, {
+          kind: "final",
+          assistantMessageIndex: 0,
+        });
+        return { queuedFinal: true };
+      },
+    );
+
+    await dispatchWithContext({
+      context: createContext(),
+      streamMode: "partial",
+      telegramCfg: { streaming: { mode: "partial" } },
+    });
+
+    expect(answerDraftStream.update.mock.calls).toEqual([[text]]);
+    const mediaDeliveries = deliverReplies.mock.calls.filter(([params]) =>
+      (params.replies as Array<{ mediaUrl?: string }> | undefined)?.some(
+        (reply) => reply.mediaUrl === mediaUrl,
+      ),
+    );
+    expect(mediaDeliveries).toHaveLength(2);
+    for (const [params] of mediaDeliveries) {
+      const delivery = expectRecordFields(params, {});
+      expectRecordFields((delivery.replies as Array<unknown>)[0], {
+        text: "",
+        mediaUrl,
+      });
+    }
+  });
+
+  it("dedupes a materialized partial after another assistant message materializes", async () => {
+    const { answerDraftStream } = setupDraftStreams({ answerMessageId: 2001 });
+    const firstText = "I will fix the layout now.";
+    const secondText = "I will verify the result next.";
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
+      async ({ dispatcherOptions, replyOptions }) => {
+        await replyOptions?.onPartialReply?.({ text: firstText });
+        await dispatcherOptions.deliver(
+          setReplyPayloadMetadata({ text: firstText }, { assistantMessageIndex: 0 }),
+          { kind: "block", assistantMessageIndex: 0 },
+        );
+        await replyOptions?.onToolStart?.({ name: "exec", phase: "start" });
+        await replyOptions?.onAssistantMessageStart?.();
+        await replyOptions?.onPartialReply?.({ text: secondText });
+        await dispatcherOptions.deliver(
+          setReplyPayloadMetadata({ text: secondText }, { assistantMessageIndex: 1 }),
+          { kind: "block", assistantMessageIndex: 1 },
+        );
+        await replyOptions?.onToolStart?.({ name: "exec", phase: "start" });
+        await dispatcherOptions.deliver(
+          setReplyPayloadMetadata({ text: firstText }, { assistantMessageIndex: 0 }),
+          { kind: "final", assistantMessageIndex: 0 },
+        );
+        return { queuedFinal: true };
+      },
+    );
+
+    await dispatchWithContext({
+      context: createContext(),
+      streamMode: "partial",
+      telegramCfg: { streaming: { mode: "partial" } },
+    });
+
+    expect(answerDraftStream.update.mock.calls).toEqual([[firstText], [secondText]]);
+    expect(emitInternalMessageSentHook).toHaveBeenCalledTimes(2);
+    expect(deliverReplies).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: "the final has no assistant identity", variant: "missing-identity" },
+    { name: "the final belongs to another assistant message", variant: "different-identity" },
+    { name: "the final text changed", variant: "different-text" },
+    { name: "the final carries inline buttons", variant: "buttons" },
+    { name: "the final carries a TTS supplement", variant: "tts-supplement" },
+  ] as const)("keeps a final after materialization when $name", async ({ variant }) => {
+    const { answerDraftStream } = setupDraftStreams({ answerMessageId: 2001 });
+    const text = "I will fix the layout now.";
+    const changedText = "The layout is fixed.";
+    const buttons = [[{ text: "OK", callback_data: "ok" }]];
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
+      async ({ dispatcherOptions, replyOptions }) => {
+        await replyOptions?.onPartialReply?.({ text });
+        await dispatcherOptions.deliver(
+          setReplyPayloadMetadata({ text }, { assistantMessageIndex: 0 }),
+          { kind: "block", assistantMessageIndex: 0 },
+        );
+        await replyOptions?.onToolStart?.({ name: "exec", phase: "start" });
+        if (variant === "missing-identity") {
+          await dispatcherOptions.deliver({ text }, { kind: "final" });
+        } else if (variant === "different-identity") {
+          await dispatcherOptions.deliver(
+            setReplyPayloadMetadata({ text }, { assistantMessageIndex: 1 }),
+            { kind: "final", assistantMessageIndex: 1 },
+          );
+        } else if (variant === "different-text") {
+          await dispatcherOptions.deliver(
+            setReplyPayloadMetadata({ text: changedText }, { assistantMessageIndex: 0 }),
+            { kind: "final", assistantMessageIndex: 0 },
+          );
+        } else if (variant === "buttons") {
+          await dispatcherOptions.deliver(
+            setReplyPayloadMetadata(
+              { text, channelData: { telegram: { buttons } } },
+              { assistantMessageIndex: 0 },
+            ),
+            { kind: "final", assistantMessageIndex: 0 },
+          );
+        } else {
+          await dispatcherOptions.deliver(
+            setReplyPayloadMetadata(
+              { text, ttsSupplement: { spokenText: "Spoken version" } },
+              { assistantMessageIndex: 0 },
+            ),
+            { kind: "final", assistantMessageIndex: 0 },
+          );
+        }
+        return { queuedFinal: true };
+      },
+    );
+
+    await dispatchWithContext({
+      context: createContext(),
+      streamMode: "partial",
+      telegramCfg: { streaming: { mode: "partial" } },
+    });
+
+    expect(answerDraftStream.update.mock.calls).toEqual([
+      [text],
+      [variant === "different-text" ? changedText : text],
+    ]);
+    expect(emitInternalMessageSentHook).toHaveBeenCalledTimes(2);
+    if (variant === "buttons") {
+      expectRecordFields(mockCallArg(editMessageTelegram, 0, 3), { buttons });
+    }
+    expect(deliverReplies).not.toHaveBeenCalled();
+  });
+
   it("keeps tool progress visible after a partial-streamed intermediate block", async () => {
     const { answerDraftStream } = setupDraftStreams({ answerMessageId: 2001 });
     dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
@@ -5753,6 +5943,265 @@ describe("dispatchTelegramMessage draft streaming", () => {
     expect(reasoningDraftStream.update).toHaveBeenCalledWith("🧠 _Thinking_");
     expect(answerDraftStream.update).toHaveBeenCalledWith("Answer");
     expect(deliverReplies).not.toHaveBeenCalled();
+  });
+
+  it("does not redeliver a materialized partial when the final flushes from reasoning", async () => {
+    const { answerDraftStream } = setupDraftStreams({ answerMessageId: 2001 });
+    const text = "I will fix the layout now.";
+    loadSessionStore.mockReturnValue({
+      s1: { reasoningLevel: "stream", sessionId: "reasoning-session" },
+    });
+    deliverReplies
+      .mockResolvedValueOnce({ delivered: false })
+      .mockResolvedValueOnce({ delivered: true });
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
+      async ({ dispatcherOptions, replyOptions }) => {
+        await replyOptions?.onPartialReply?.({ text });
+        await dispatcherOptions.deliver(
+          setReplyPayloadMetadata({ text }, { assistantMessageIndex: 0 }),
+          { kind: "block", assistantMessageIndex: 0 },
+        );
+        await replyOptions?.onToolStart?.({ name: "exec", phase: "start" });
+        await dispatcherOptions.deliver(
+          { text: "<think>first attempt</think>", isReasoning: true },
+          { kind: "block" },
+        );
+        await dispatcherOptions.deliver(
+          setReplyPayloadMetadata({ text }, { assistantMessageIndex: 0 }),
+          { kind: "final", assistantMessageIndex: 0 },
+        );
+        await dispatcherOptions.deliver(
+          { text: "<think>second attempt</think>", isReasoning: true },
+          { kind: "block" },
+        );
+        return { queuedFinal: true };
+      },
+    );
+
+    await dispatchWithContext({
+      context: createContext({
+        ctxPayload: { SessionKey: "s1" } as unknown as TelegramMessageContext["ctxPayload"],
+      }),
+      streamMode: "partial",
+      telegramCfg: { streaming: { mode: "partial" } },
+    });
+
+    expect(answerDraftStream.update.mock.calls).toEqual([[text]]);
+    expect(emitInternalMessageSentHook).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps buttons when a materialized final flushes from reasoning", async () => {
+    const { answerDraftStream } = setupDraftStreams({ answerMessageId: 2001 });
+    const text = "I will fix the layout now.";
+    const buttons = [[{ text: "OK", callback_data: "ok" }]];
+    loadSessionStore.mockReturnValue({
+      s1: { reasoningLevel: "stream", sessionId: "reasoning-session" },
+    });
+    deliverReplies
+      .mockResolvedValueOnce({ delivered: false })
+      .mockResolvedValueOnce({ delivered: true });
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
+      async ({ dispatcherOptions, replyOptions }) => {
+        await replyOptions?.onPartialReply?.({ text });
+        await dispatcherOptions.deliver(
+          setReplyPayloadMetadata({ text }, { assistantMessageIndex: 0 }),
+          { kind: "block", assistantMessageIndex: 0 },
+        );
+        await replyOptions?.onToolStart?.({ name: "exec", phase: "start" });
+        await dispatcherOptions.deliver(
+          { text: "<think>first attempt</think>", isReasoning: true },
+          { kind: "block" },
+        );
+        await dispatcherOptions.deliver(
+          setReplyPayloadMetadata(
+            { text, channelData: { telegram: { buttons } } },
+            { assistantMessageIndex: 0 },
+          ),
+          { kind: "final", assistantMessageIndex: 0 },
+        );
+        await dispatcherOptions.deliver(
+          { text: "<think>second attempt</think>", isReasoning: true },
+          { kind: "block" },
+        );
+        return { queuedFinal: true };
+      },
+    );
+
+    await dispatchWithContext({
+      context: createContext({
+        ctxPayload: { SessionKey: "s1" } as unknown as TelegramMessageContext["ctxPayload"],
+      }),
+      streamMode: "partial",
+      telegramCfg: { streaming: { mode: "partial" } },
+    });
+
+    expect(answerDraftStream.update.mock.calls).toEqual([[text], [text]]);
+    expect(emitInternalMessageSentHook).toHaveBeenCalledTimes(2);
+    expect(editMessageTelegram).toHaveBeenCalledWith(
+      123,
+      expect.any(Number),
+      text,
+      expect.objectContaining({ buttons }),
+    );
+  });
+
+  it("keeps a TTS supplement when a materialized final flushes from reasoning", async () => {
+    const { answerDraftStream } = setupDraftStreams({ answerMessageId: 2001 });
+    const text = "I will fix the layout now.";
+    const ttsSupplement = { spokenText: "Spoken version" };
+    loadSessionStore.mockReturnValue({
+      s1: { reasoningLevel: "stream", sessionId: "reasoning-session" },
+    });
+    deliverReplies
+      .mockResolvedValueOnce({ delivered: false })
+      .mockResolvedValueOnce({ delivered: true });
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
+      async ({ dispatcherOptions, replyOptions }) => {
+        await replyOptions?.onPartialReply?.({ text });
+        await dispatcherOptions.deliver(
+          setReplyPayloadMetadata({ text }, { assistantMessageIndex: 0 }),
+          { kind: "block", assistantMessageIndex: 0 },
+        );
+        await replyOptions?.onToolStart?.({ name: "exec", phase: "start" });
+        await dispatcherOptions.deliver(
+          { text: "<think>first attempt</think>", isReasoning: true },
+          { kind: "block" },
+        );
+        await dispatcherOptions.deliver(
+          setReplyPayloadMetadata({ text, ttsSupplement }, { assistantMessageIndex: 0 }),
+          { kind: "final", assistantMessageIndex: 0 },
+        );
+        await dispatcherOptions.deliver(
+          { text: "<think>second attempt</think>", isReasoning: true },
+          { kind: "block" },
+        );
+        return { queuedFinal: true };
+      },
+    );
+
+    await dispatchWithContext({
+      context: createContext({
+        ctxPayload: { SessionKey: "s1" } as unknown as TelegramMessageContext["ctxPayload"],
+      }),
+      streamMode: "partial",
+      telegramCfg: { streaming: { mode: "partial" } },
+    });
+
+    expect(answerDraftStream.update.mock.calls).toEqual([[text], [text]]);
+    expect(emitInternalMessageSentHook).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps a reply target when a materialized final flushes from reasoning", async () => {
+    const { answerDraftStream } = setupDraftStreams({ answerMessageId: 2001 });
+    const text = "I will fix the layout now.";
+    loadSessionStore.mockReturnValue({
+      s1: { reasoningLevel: "stream", sessionId: "reasoning-session" },
+    });
+    deliverReplies.mockResolvedValue({ delivered: true });
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
+      async ({ dispatcherOptions, replyOptions }) => {
+        await replyOptions?.onPartialReply?.({ text });
+        await dispatcherOptions.deliver(
+          setReplyPayloadMetadata({ text }, { assistantMessageIndex: 0 }),
+          { kind: "block", assistantMessageIndex: 0 },
+        );
+        await replyOptions?.onToolStart?.({ name: "exec", phase: "start" });
+        await dispatcherOptions.deliver(
+          { text: "<think>first attempt</think>", isReasoning: true },
+          { kind: "block" },
+        );
+        await dispatcherOptions.deliver(
+          setReplyPayloadMetadata({ text, replyToId: "9001" }, { assistantMessageIndex: 0 }),
+          { kind: "final", assistantMessageIndex: 0 },
+        );
+        await dispatcherOptions.deliver(
+          { text: "<think>second attempt</think>", isReasoning: true },
+          { kind: "block" },
+        );
+        return { queuedFinal: true };
+      },
+    );
+
+    await dispatchWithContext({
+      context: createContext({
+        ctxPayload: {
+          SessionKey: "s1",
+          ReplyToId: "9001",
+          ReplyToBody: "older source",
+          ReplyToQuoteSourceText: "Exact older source",
+        } as unknown as TelegramMessageContext["ctxPayload"],
+      }),
+      streamMode: "partial",
+      telegramCfg: { streaming: { mode: "partial" } },
+    });
+
+    expect(answerDraftStream.update.mock.calls).toEqual([[text]]);
+    const finalDeliveryCall = deliverReplies.mock.calls.find(([params]) =>
+      (params.replies as Array<{ replyToId?: string }> | undefined)?.some(
+        (reply) => reply.replyToId === "9001",
+      ),
+    );
+    const delivery = expectRecordFields(finalDeliveryCall?.[0], {
+      replyQuoteByMessageId: expect.objectContaining({
+        "9001": { text: "Exact older source", position: 0 },
+      }),
+    });
+    expectRecordFields((delivery.replies as Array<unknown>)[0], { text, replyToId: "9001" });
+  });
+
+  it("keeps media when a materialized final flushes from reasoning", async () => {
+    const { answerDraftStream } = setupDraftStreams({ answerMessageId: 2001 });
+    const text = "I will fix the layout now.";
+    const mediaUrl = "https://example.com/fixed-layout.png";
+    loadSessionStore.mockReturnValue({
+      s1: { reasoningLevel: "stream", sessionId: "reasoning-session" },
+    });
+    deliverReplies
+      .mockResolvedValueOnce({ delivered: false })
+      .mockResolvedValueOnce({ delivered: true });
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
+      async ({ dispatcherOptions, replyOptions }) => {
+        await replyOptions?.onPartialReply?.({ text });
+        await dispatcherOptions.deliver(
+          setReplyPayloadMetadata({ text }, { assistantMessageIndex: 0 }),
+          { kind: "block", assistantMessageIndex: 0 },
+        );
+        await replyOptions?.onToolStart?.({ name: "exec", phase: "start" });
+        await dispatcherOptions.deliver(
+          { text: "<think>first attempt</think>", isReasoning: true },
+          { kind: "block" },
+        );
+        await dispatcherOptions.deliver(
+          setReplyPayloadMetadata({ text, mediaUrl }, { assistantMessageIndex: 0 }),
+          { kind: "final", assistantMessageIndex: 0 },
+        );
+        await dispatcherOptions.deliver(
+          { text: "<think>second attempt</think>", isReasoning: true },
+          { kind: "block" },
+        );
+        return { queuedFinal: true };
+      },
+    );
+
+    await dispatchWithContext({
+      context: createContext({
+        ctxPayload: { SessionKey: "s1" } as unknown as TelegramMessageContext["ctxPayload"],
+      }),
+      streamMode: "partial",
+      telegramCfg: { streaming: { mode: "partial" } },
+    });
+
+    expect(answerDraftStream.update.mock.calls).toEqual([[text]]);
+    const mediaDeliveryCall = deliverReplies.mock.calls.find(([params]) =>
+      (params.replies as Array<{ mediaUrl?: string }> | undefined)?.some(
+        (reply) => reply.mediaUrl === mediaUrl,
+      ),
+    );
+    const delivery = expectRecordFields(mediaDeliveryCall?.[0], {});
+    expectRecordFields((delivery.replies as Array<unknown>)[0], {
+      text: "",
+      mediaUrl,
+    });
   });
 
   it("emits final hooks when a buffered answer flushes after reasoning delivery", async () => {

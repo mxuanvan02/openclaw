@@ -124,6 +124,7 @@ export function splitTelegramReasoningText(
 type BufferedFinalAnswer = {
   payload: ReplyPayload;
   text: string;
+  assistantMessageIndex?: number;
   bufferedGeneration?: number;
 };
 

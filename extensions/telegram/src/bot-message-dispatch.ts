@@ -1078,11 +1078,13 @@ export const dispatchTelegramMessage = async ({
     payload: ReplyPayload;
     text: string;
     buttons: TelegramInlineButtons | undefined;
+    assistantMessageIndex?: number;
   };
   let lastAnswerPartialText = "";
   let activeAnswerDraftIsToolProgressOnly = false;
   let activeAnswerBlockAssistantMessageIndex: number | undefined;
   let activeAnswerBlockDelivery: AnswerBlockDelivery | undefined;
+  const materializedAnswerBlocks = new Map<number, string>();
   let materializeAnswerLaneBeforeRotation: (() => Promise<void>) | undefined;
   type QueuedAnswerBlockRotation = {
     assistantMessageIndex?: number;
@@ -1752,6 +1754,50 @@ export const dispatchTelegramMessage = async ({
       }
       return payload.replyToId != null && replyQuoteByMessageId[payload.replyToId] != null;
     };
+    const resolveMaterializedAnswerDedupeCandidate = (
+      payload: ReplyPayload,
+      text: string,
+      buttons?: TelegramInlineButtons,
+    ): { text: string; hasMedia: boolean } | undefined => {
+      const projected = projectPayloadForDelivery(applyTextToPayload(payload, text));
+      if (!projected || buttons !== undefined || usesNativeTelegramQuote(projected)) {
+        return undefined;
+      }
+      const parts = resolveSendableOutboundReplyParts(projected);
+      if (
+        !parts.hasText ||
+        projected.presentation !== undefined ||
+        projected.interactive !== undefined ||
+        projected.channelData !== undefined ||
+        projected.replyToId !== undefined ||
+        projected.replyToTag === true ||
+        projected.replyToCurrent === true ||
+        projected.delivery !== undefined ||
+        projected.location !== undefined ||
+        projected.audioAsVoice === true ||
+        projected.videoAsNote === true ||
+        projected.spokenText !== undefined ||
+        projected.ttsSupplement !== undefined ||
+        projected.btw !== undefined ||
+        projected.isError === true ||
+        projected.isReasoning === true ||
+        projected.isCommentary === true ||
+        projected.isCompactionNotice === true ||
+        projected.isFallbackNotice === true ||
+        projected.isStatusNotice === true
+      ) {
+        return undefined;
+      }
+      return { text: parts.text.trimEnd(), hasMedia: parts.hasMedia };
+    };
+    const resolvePlainTextForMaterializedAnswerDedupe = (
+      payload: ReplyPayload,
+      text: string,
+      buttons?: TelegramInlineButtons,
+    ): string | undefined => {
+      const candidate = resolveMaterializedAnswerDedupeCandidate(payload, text, buttons);
+      return candidate && !candidate.hasMedia ? candidate.text : undefined;
+    };
     const recordPromptContextMessage = (params: {
       messageId: number;
       message?: Message;
@@ -1946,7 +1992,12 @@ export const dispatchTelegramMessage = async ({
       // post-dispatch this is the terminal answer, not another markerless
       // intermediate block; use the ordinary final/collapse path with its text.
       markProgressFinalStarted();
-      await deliverFinalAnswerText(blockDelivery.payload, content, blockDelivery.buttons);
+      await deliverFinalAnswerText(
+        blockDelivery.payload,
+        content,
+        blockDelivery.buttons,
+        blockDelivery.assistantMessageIndex,
+      );
       activeAnswerBlockDelivery = undefined;
     };
     const deliverLaneText = createLaneTextDeliverer({
@@ -2005,6 +2056,21 @@ export const dispatchTelegramMessage = async ({
         durable: false,
       });
       activeAnswerBlockDelivery = undefined;
+      if (blockDelivery.assistantMessageIndex !== undefined) {
+        const materializedText =
+          result.kind === "preview-finalized"
+            ? result.delivery.content.trimEnd()
+            : result.kind === "sent"
+              ? resolvePlainTextForMaterializedAnswerDedupe(
+                  blockDelivery.payload,
+                  text,
+                  blockDelivery.buttons,
+                )
+              : undefined;
+        if (materializedText !== undefined) {
+          materializedAnswerBlocks.set(blockDelivery.assistantMessageIndex, materializedText);
+        }
+      }
       await emitPreviewFinalizedHook(result);
     };
     // The one-line activity digest for the collapse bar, or undefined when the
@@ -2153,16 +2219,32 @@ export const dispatchTelegramMessage = async ({
       answerPayload: ReplyPayload,
       text: string,
       buttons?: TelegramInlineButtons,
+      assistantMessageIndex?: number,
     ): Promise<LaneDeliveryResult> {
       const transcriptFinal = await resolveCurrentTurnTranscriptFinal();
       const finalText = await resolveTranscriptBackedChannelFinalText({
         finalText: text,
         resolveCandidateText: async () => transcriptFinal?.text,
       });
+      const dedupeCandidate = resolveMaterializedAnswerDedupeCandidate(
+        answerPayload,
+        finalText,
+        buttons,
+      );
+      const matchesMaterializedAnswer =
+        assistantMessageIndex !== undefined &&
+        dedupeCandidate !== undefined &&
+        materializedAnswerBlocks.get(assistantMessageIndex) === dedupeCandidate.text;
+      if (matchesMaterializedAnswer && !dedupeCandidate.hasMedia) {
+        materializedAnswerBlocks.delete(assistantMessageIndex);
+        markProgressFinalDelivered();
+        return { kind: "sent" };
+      }
+      const deliveryText = matchesMaterializedAnswer ? "" : finalText;
       const source = resolvePromptContextSource(
         transcriptFinal,
         answerPayload,
-        applyTextToPayload(answerPayload, finalText),
+        applyTextToPayload(answerPayload, deliveryText),
       );
       const promptContextSequence = createPromptContextSequence(source);
       const isFollowUp = finalAnswerDelivered;
@@ -2170,7 +2252,7 @@ export const dispatchTelegramMessage = async ({
       if (!isFollowUp && streamMode === "progress") {
         result = await deliverProgressModeFinalAnswer(
           answerPayload,
-          finalText,
+          deliveryText,
           promptContextSequence,
         );
       } else {
@@ -2181,7 +2263,7 @@ export const dispatchTelegramMessage = async ({
         }
         result = await deliverLaneText({
           laneName: "answer",
-          text: finalText,
+          text: deliveryText,
           payload: answerPayload,
           infoKind: "final",
           buttons,
@@ -2191,6 +2273,13 @@ export const dispatchTelegramMessage = async ({
         if (!isFollowUp && result.kind !== "skipped") {
           markProgressFinalDelivered();
         }
+      }
+      if (
+        matchesMaterializedAnswer &&
+        assistantMessageIndex !== undefined &&
+        result.kind !== "skipped"
+      ) {
+        materializedAnswerBlocks.delete(assistantMessageIndex);
       }
       if (result.kind === "preview-finalized") {
         await emitPreviewFinalizedHook(result);
@@ -2357,6 +2446,7 @@ export const dispatchTelegramMessage = async ({
                         buffered.payload,
                         buffered.text,
                         bufferedButtons,
+                        buffered.assistantMessageIndex,
                       );
                       reasoningStepState.resetForNextStep();
                     };
@@ -2375,6 +2465,7 @@ export const dispatchTelegramMessage = async ({
                         reasoningStepState.bufferFinalAnswer({
                           payload: effectivePayload,
                           text: segment.update.text,
+                          assistantMessageIndex: info.assistantMessageIndex,
                           bufferedGeneration: replyFenceGeneration,
                         });
                         continue;
@@ -2467,6 +2558,7 @@ export const dispatchTelegramMessage = async ({
                           payload: effectivePayload,
                           text: segment.update.text,
                           buttons: telegramButtons,
+                          assistantMessageIndex: info.assistantMessageIndex,
                         };
                         resetAnswerToolProgressDraft();
                         resetProgressDraftState();
@@ -2501,6 +2593,7 @@ export const dispatchTelegramMessage = async ({
                               effectivePayload,
                               segment.update.text,
                               telegramButtons,
+                              info.assistantMessageIndex,
                             )
                           : await deliverLaneText({
                               laneName: segment.lane,
@@ -2525,6 +2618,7 @@ export const dispatchTelegramMessage = async ({
                           payload: lanePayload,
                           text: segment.update.text,
                           buttons: telegramButtons,
+                          assistantMessageIndex: info.assistantMessageIndex,
                         };
                       }
                       blockDelivered = blockDelivered || result.kind !== "skipped";
