@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { redactSensitiveText } from "../logging/redact.js";
 import { resetSecretRedactionRegistryForTest } from "../logging/secret-redaction-registry.js";
 import {
@@ -82,6 +82,29 @@ describe("secret sentinels", () => {
       );
     },
   );
+
+  it("keeps sentinels resolvable when the module is instantiated more than once", async () => {
+    // Regression: the runtime loads this module twice in one process (ESM dist
+    // graph plus a jiti-compiled CommonJS copy for the plugin runtime). When the
+    // AES key was module-local, each copy derived its own and egress failed with
+    // "not registered in this process". Re-importing after resetModules
+    // reproduces the second instantiation.
+    const first = await import("./sentinel.js");
+    const sentinel = first.mintSecretSentinel("cross-instance-secret", {
+      label: "model-auth:cross-instance",
+    });
+
+    vi.resetModules();
+    const second = await import("./sentinel.js");
+
+    expect(second).not.toBe(first);
+    expect(second.resolveSecretSentinel(sentinel)).toBe("cross-instance-secret");
+    expect(
+      second.mintSecretSentinel("cross-instance-secret", {
+        label: "model-auth:cross-instance",
+      }),
+    ).toBe(sentinel);
+  });
 
   it("registers minted values for exact redaction across registry eviction", () => {
     const first = "sentinel-registry-value-000";

@@ -15,7 +15,36 @@ export const SECRET_SENTINEL_PATTERN = new RegExp(SECRET_SENTINEL_SOURCE, "g");
 
 // One process key keeps sentinels resolvable for in-flight requests without a
 // plaintext registry that retains every historical credential until exit.
-const secretSentinelKeys = randomBytes(64);
+//
+// The key is pinned to globalThis because this module can be instantiated more
+// than once inside a single process: the ESM dist graph loads it directly while
+// the plugin runtime loads a jiti-compiled CommonJS copy of the same file. With
+// a module-local key each copy derived its own, so a sentinel minted by one
+// copy could not be opened by the other and egress failed with
+// "not registered in this process". The key never leaves process memory, so
+// sharing it across copies does not widen its exposure.
+const SECRET_SENTINEL_KEY_SLOT = "__openclawSecretSentinelKeys";
+const SECRET_SENTINEL_KEY_BYTES = 64;
+
+function loadSecretSentinelKeys(): Buffer {
+  const host = globalThis as unknown as Record<string, unknown>;
+  const existing = host[SECRET_SENTINEL_KEY_SLOT];
+  if (Buffer.isBuffer(existing) && existing.length === SECRET_SENTINEL_KEY_BYTES) {
+    return existing;
+  }
+  const created = randomBytes(SECRET_SENTINEL_KEY_BYTES);
+  Object.defineProperty(host, SECRET_SENTINEL_KEY_SLOT, {
+    value: created,
+    // Non-enumerable and locked down so the key stays out of globalThis dumps
+    // and cannot be swapped out by later code.
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+  return created;
+}
+
+const secretSentinelKeys = loadSecretSentinelKeys();
 const secretSentinelCipherKey = secretSentinelKeys.subarray(0, 32);
 const secretSentinelNonceKey = secretSentinelKeys.subarray(32);
 
