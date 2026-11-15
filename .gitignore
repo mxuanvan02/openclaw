@@ -1,6 +1,11 @@
 node_modules
 **/node_modules/
 .env
+.env.bak*
+*.env.bak*
+browsers/
+logs/
+artifacts/
 docker-compose.override.yml
 docker-compose.extra.yml
 dist

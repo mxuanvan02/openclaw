@@ -9,6 +9,8 @@ The OpenClaw stack supports automation, tool use, and cloud integration, while e
 - **openclaw-gateway**: This service handles external API requests, core session logic, and routes communication internally. Needs to be highly available.
 - **openclaw-cli**: Runs agent-like loops, handling execution steps and interactions without binding to ports, sharing the gateway network mode. Allows running commands directly against the gateway logic.
 - **browser-worker**: Based on the Microsoft Playwright Jammy image, this service handles actual web-based tasks (Overleaf, Colab, scraping, or screenshots). 
+- **vnc-debug-browser**: A sandbox browser derived from `debian:bookworm-slim` with `x11vnc` and `novnc`. By accessing `localhost:6080`, human operators can visually monitor agent-driven automated UI tasks in real time locally.
+- **MCP Toolkit**: Python/Node toolkits (`scripts/mcp-toolkit.js`) expose the repository's `./scripts` as native Model Context Protocol tools over JSON-RPC stdio.
 
 ### Directories & Mounts:
 

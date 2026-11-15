@@ -21,6 +21,13 @@ services:
       OPENCLAW_ARTIFACTS_DIR: /usr/local/share/artifacts
       OPENCLAW_LOGS_DIR: /usr/local/share/logs
       OPENCLAW_SCRIPTS_DIR: /usr/local/share/scripts
+      OPENCLAW_WORKSPACE_DIR: /home/node/.openclaw/workspace
+      PLAYWRIGHT_BROWSERS_PATH: /home/node/.cache/ms-playwright
+      OPENCLAW_GATEWAY_BIND: lan
+      DBUS_SESSION_BUS_ADDRESS: /dev/null
+      OPENCLAW_BROWSER_NO_SANDBOX: "1"
+      UV_THREADPOOL_SIZE: "64"
+      NODE_OPTIONS: "--dns-result-order=ipv4first"
     volumes:
       - ./artifacts:/usr/local/share/artifacts:rw
       - ./logs:/usr/local/share/logs:rw
@@ -33,34 +40,19 @@ services:
       ## scripts/docker/setup.sh with OPENCLAW_SANDBOX=1 for automated setup.
       ## Set DOCKER_GID to the host's docker group GID (run: stat -c '%g' /var/run/docker.sock).
       # - /var/run/docker.sock:/var/run/docker.sock
-    # group_add:
-    #   - "${DOCKER_GID:-999}"
+      # group_add:
+      #   - "${DOCKER_GID:-999}"
       - /media/SAS/Van/HybridStackPPI:/mnt/HybridStackPPI:rw
       - /media/SAS/Van/Unified_Vista:/mnt/Unified_Vista:rw
       - /opt/openclaw/bin/guard-shell:/usr/local/bin/guard-shell:ro
-    ports:
-      - "${OPENCLAW_GATEWAY_PORT:-18789}:18789"
-      - "${OPENCLAW_BRIDGE_PORT:-18790}:18790"
+      - ./browsers:/home/node/.cache/ms-playwright:rw
+    network_mode: host
+    hostname: openclaw-gateway
     init: true
     restart: unless-stopped
-    command:
-      [
-        "node",
-        "dist/index.js",
-        "gateway",
-        "--bind",
-        "${OPENCLAW_GATEWAY_BIND:-lan}",
-        "--port",
-        "18789",
-      ]
+    command: [ "node", "dist/index.js", "gateway", "--bind", "${OPENCLAW_GATEWAY_BIND:-lan}", "--port", "18888" ]
     healthcheck:
-      test:
-        [
-          "CMD",
-          "node",
-          "-e",
-          "fetch('http://127.0.0.1:18789/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
-        ]
+      test: [ "CMD", "node", "-e", "fetch('http://127.0.0.1:18789/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" ]
       interval: 30s
       timeout: 5s
       retries: 5
@@ -68,15 +60,10 @@ services:
 
   openclaw-cli:
     image: ${OPENCLAW_IMAGE:-openclaw:local}
-    network_mode: "service:openclaw-gateway"
-    cap_drop:
-      - NET_RAW
-      - NET_ADMIN
-    security_opt:
-      - no-new-privileges:true
     environment:
       HOME: /home/node
       TERM: xterm-256color
+      OPENCLAW_GATEWAY_URL: ws://openclaw-gateway:18789
       OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:-}
       OPENCLAW_ALLOW_INSECURE_PRIVATE_WS: ${OPENCLAW_ALLOW_INSECURE_PRIVATE_WS:-}
       BROWSER: echo
@@ -95,6 +82,7 @@ services:
       OPENCLAW_ARTIFACTS_DIR: /usr/local/share/artifacts
       OPENCLAW_LOGS_DIR: /usr/local/share/logs
       OPENCLAW_SCRIPTS_DIR: /usr/local/share/scripts
+      OPENCLAW_WORKSPACE_DIR: /home/node/.openclaw/workspace
     volumes:
       - ./artifacts:/usr/local/share/artifacts:rw
       - ./logs:/usr/local/share/logs:rw
@@ -107,7 +95,7 @@ services:
     stdin_open: true
     tty: true
     init: true
-    entrypoint: ["node", "dist/index.js"]
+    entrypoint: [ "node", "dist/index.js" ]
     depends_on:
       - openclaw-gateway
 
@@ -122,7 +110,27 @@ services:
       - ./scripts:/usr/local/share/scripts:ro
       - ${OPENCLAW_WORKSPACE_DIR:-./workspace}:/home/node/.openclaw/workspace
     working_dir: /usr/local/share/scripts
-    command: ["tail", "-f", "/dev/null"]
+    command: [ "tail", "-f", "/dev/null" ]
+    restart: unless-stopped
+    security_opt:
+      - seccomp:unconfined
+
+  vnc-debug-browser:
+    build:
+      context: .
+      dockerfile: Dockerfile.sandbox-browser
+    environment:
+      TZ: ${OPENCLAW_TZ:-UTC}
+      OPENCLAW_BROWSER_NO_SANDBOX: "1"
+      OPENCLAW_BROWSER_NOVNC_PASSWORD: "admin"
+    volumes:
+      - ./artifacts:/home/sandbox/artifacts:rw
+      - ./scripts:/home/sandbox/scripts:ro
+      - ${OPENCLAW_WORKSPACE_DIR:-./workspace}:/home/sandbox/workspace:rw
+    ports:
+      - "6080:6080" # noVNC web viewer
+      - "5900:5900" # raw VNC port
+      - "9222:9222" # CDP Remote debugging port
     restart: unless-stopped
     security_opt:
       - seccomp:unconfined
